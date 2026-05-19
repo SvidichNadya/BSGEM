@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import subprocess
 import sys
 import os
@@ -33,7 +36,9 @@ IMPORT_MAP = {
     "joblib": "joblib",
     "scipy": "scipy",
     "statsmodels": "statsmodels",
-    "econml": "econml"
+    "econml": "econml",
+    "hmmlearn": "hmmlearn",
+    "pytorch-forecasting": "pytorch_forecasting"
 }
 
 for pkg, imp in IMPORT_MAP.items():
@@ -66,6 +71,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 import statsmodels.api as sm
 from statsmodels.tsa.ar_model import AutoReg
+from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 import lightgbm as lgb
 import shap
 import nltk
@@ -74,13 +80,19 @@ import matplotlib.pyplot as plt
 from matplotlib.pylab import rcParams
 rcParams['figure.figsize'] = 12, 6
 
-# Attempt causal forest (econml)
+# For HMM
+from hmmlearn import hmm
+
+# For benchmarks
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.distributions import Normal
+
+# econml
 try:
     from econml.dml import CausalForestDML
     CAUSAL_AVAILABLE = True
 except ImportError:
     CAUSAL_AVAILABLE = False
-    print("econml not available. Causal Forest will use a simplified T-learner.")
 
 nltk.download('punkt', quiet=True)
 nltk.download('punkt_tab', quiet=True)
@@ -369,9 +381,60 @@ def aggregate_mpc(anxiety, n_agents=5000):
     return np.mean(consumption_shares)
 
 # =============================================================================
-# Dynamic causal graph, Markov regime switching, and main VAE model
+# BENCHMARKS
 # =============================================================================
+class TransformerForecaster(nn.Module):
+    def __init__(self, input_dim, d_model=64, nhead=4, num_layers=3, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Linear(input_dim, d_model)
+        encoder_layer = TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
+        self.transformer = TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc_out = nn.Linear(d_model, 1)
 
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.transformer(x)
+        out = self.fc_out(x[:, -1, :])
+        return out
+
+class DeepAR(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc_mu = nn.Linear(hidden_dim, 1)
+        self.fc_sigma = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]
+        mu = self.fc_mu(out)
+        sigma = torch.exp(self.fc_sigma(out)) + 1e-6
+        return mu, sigma
+
+def train_deepar(model, X_train, y_train, epochs=50, lr=0.001):
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                            torch.tensor(y_train, dtype=torch.float32).view(-1,1))
+    loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for batch_x, batch_y in loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            optimizer.zero_grad()
+            mu, sigma = model(batch_x)
+            dist = Normal(mu, sigma)
+            loss = -dist.log_prob(batch_y).mean()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        if (epoch+1) % 10 == 0:
+            print(f"DeepAR epoch {epoch+1}, loss={total_loss/len(loader):.4f}")
+    return model
+
+# =============================================================================
+# DYNAMIC CAUSAL GRAPH, MARKOV REGIME, VAE
+# =============================================================================
 class DynamicCausalGraph(nn.Module):
     def __init__(self, feature_dim, hidden_dim=32):
         super().__init__()
@@ -424,14 +487,12 @@ class BSGEM_VAE(nn.Module):
         self.use_endogenous = use_endogenous
         self.use_regime = use_regime
 
-        # Encoder
         self.enc_fc = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, latent_dim*2)
         )
 
-        # Decoder input size
         dec_input_dim = latent_dim + input_dim
         if use_endogenous:
             dec_input_dim += 1
@@ -442,10 +503,7 @@ class BSGEM_VAE(nn.Module):
         self.dec_fc = nn.Linear(hidden_dim, 1)
         self.attn = nn.Linear(hidden_dim, 1)
 
-        # Dynamic causal graph
         self.dcg = DynamicCausalGraph(input_dim, hidden_dim=32)
-
-        # Regime switching
         if use_regime:
             self.regime_switch = MarkovRegimeSwitching(n_regimes, input_dim, hidden_dim)
         else:
@@ -472,7 +530,7 @@ class BSGEM_VAE(nn.Module):
         mu, logvar = self.encode(x, adj)
         z = self.reparameterize(mu, logvar)
 
-        # Self‑deception
+        # Self-deception
         z_mean = z.mean(dim=1, keepdim=True)
         confidence = torch.sigmoid(1.0 - logvar.mean(dim=-1, keepdim=True))
         self_deception = self.kappa_self * (z - z_mean) * confidence
@@ -480,14 +538,15 @@ class BSGEM_VAE(nn.Module):
 
         # Regime probabilities
         if self.use_regime and self.regime_switch is not None:
-            regime_probs = self.regime_switch(x)
+            regime_probs = self.regime_switch(x)   # (batch, seq, n_regimes)
         else:
             regime_probs = torch.zeros(batch, seq, 1, device=x.device)
 
         # Endogenous field
         if self.use_endogenous:
-            avg_opinion = regime_probs[:, :, 0].mean(dim=1, keepdim=True).unsqueeze(-1)
-            avg_opinion = avg_opinion.expand(-1, seq, -1)
+            # use first component of regime_probs as collective opinion
+            avg_opinion = regime_probs[:, :, 0].mean(dim=1, keepdim=True).unsqueeze(-1)  # (batch,1,1)
+            avg_opinion = avg_opinion.expand(-1, seq, -1)  # (batch, seq, 1)
             endog_field = self.omega * avg_opinion
             x_aug = torch.cat([x, endog_field], dim=-1)
         else:
@@ -559,7 +618,7 @@ def train_vae(model, X_train, y_train, X_val, y_val, epochs=150, lr=0.001, patie
     model.load_state_dict(best_state)
     return model, train_losses, val_losses
 
-# ---------- Spatial weight matrix ----------
+# ---------- Spatial weights ----------
 def build_spatial_weights(timestamps, decay=0.1):
     t_vals = np.array([ts.timestamp() for ts in timestamps])
     n = len(t_vals)
@@ -576,7 +635,6 @@ def build_spatial_weights(timestamps, decay=0.1):
 
 # ---------- Feature extraction (batched, cached) ----------
 def extract_all_features(texts, timestamps, cache_embeddings_flag=True):
-    # Embeddings
     embedder = SentenceTransformer('cointegrated/rubert-tiny2')
     cache_key = get_cache_key(texts, "rubert_tiny2")
     if cache_embeddings_flag and (CACHE_DIR / cache_key).exists():
@@ -589,7 +647,6 @@ def extract_all_features(texts, timestamps, cache_embeddings_flag=True):
             with open(CACHE_DIR / cache_key, 'wb') as f:
                 pickle.dump(embeddings, f)
 
-    # Sentiment
     sentiment_pipeline = pipeline("sentiment-analysis", model="blanchefort/rubert-base-cased-sentiment", device=-1)
     sentiments = []
     batch_size = 32
@@ -599,7 +656,6 @@ def extract_all_features(texts, timestamps, cache_embeddings_flag=True):
         sentiments.extend([r['score'] if r['label']=='POSITIVE' else -r['score'] for r in res])
     sentiments = np.array(sentiments)
 
-    # Lexical
     anxiety_words = {'тревога','страх','паника','девальвация','кризис','обвал','потеря','риск','катастрофа','коллапс'}
     confidence_words = {'точно','100%','уверен','гарантированно','абсолютно','безусловно','очевидно'}
     uncertainty_words = {'возможно','наверное','может быть','вероятно','скорее всего','не уверен','сомневаюсь'}
@@ -616,7 +672,6 @@ def extract_all_features(texts, timestamps, cache_embeddings_flag=True):
     confidence = np.array(confidence)
     uncertainty = np.array(uncertainty)
 
-    # NLI semantic consistency
     nli = RussianNLI()
     pairs = [(texts[i-1], texts[i]) for i in range(1, len(texts))]
     consistency = []
@@ -627,13 +682,11 @@ def extract_all_features(texts, timestamps, cache_embeddings_flag=True):
         consistency.extend(1 - contr)
     semantic_consistency = np.array([0.5] + consistency)
 
-    # Narrative
     narrative = NarrativeExtractor()
     topics = narrative.fit(texts, embeddings)
     nai_series = narrative.compute_nai_series(topics, timestamps, np.abs(sentiments), window=3)
     narrative_stats = narrative.persistence_stats(topics, timestamps)
 
-    # Information field
     info_field = InformationField()
     time_gaps = np.diff([ts.timestamp() for ts in timestamps])
     time_gaps = np.insert(time_gaps, 0, 1.0)
@@ -649,11 +702,9 @@ def extract_all_features(texts, timestamps, cache_embeddings_flag=True):
     mem = info_field.cognitive_memory(energy)
     mem_sat = info_field.saturated_memory(mem)
 
-    # SSI
     ssi_calc = SocialSuggestibilityIndex(n_agents=50)
     ssi_series = ssi_calc.compute(potentials)
 
-    # VAI
     def vai_series(sent, conf, unc, nai, window=5):
         vai = []
         for i in range(len(sent)):
@@ -674,19 +725,22 @@ def extract_all_features(texts, timestamps, cache_embeddings_flag=True):
     smoothed_uncertainty = smoothed[:,2]
     smoothed_sentiment = smoothed[:,3]
 
-    # HMM regime (simple threshold)
-    regime_probs = (smoothed_anxiety > np.median(smoothed_anxiety)).astype(float)
+    # Full HMM with learned transition probabilities
+    try:
+        model_hmm = MarkovRegression(smoothed_anxiety, k_regimes=2, trend='c', switching_variance=True)
+        res_hmm = model_hmm.fit()
+        regime_probs = res_hmm.smoothed_marginal_probabilities[:, 0]  # probability of regime 1
+    except:
+        regime_probs = (smoothed_anxiety > np.median(smoothed_anxiety)).astype(float)
 
     vai = vai_series(sentiments, confidence, uncertainty, nai_series)
 
-    # NAI lags
     nai_lag1 = np.roll(nai_series, 1)
     nai_lag2 = np.roll(nai_series, 2)
     nai_lag1[0] = nai_series[0]
     nai_lag2[0] = nai_series[0]
     nai_lag2[1] = nai_series[1]
 
-    # MPC
     avg_anxiety = np.mean(smoothed_anxiety)
     mpc = aggregate_mpc(avg_anxiety, n_agents=2000)
     mpc_series = np.full(len(texts), mpc)
@@ -708,7 +762,7 @@ def extract_all_features(texts, timestamps, cache_embeddings_flag=True):
     return X, {'info_gradient': F_info, 'info_energy': energy, 'memory_sat': mem_sat}
 
 # =============================================================================
-# MAIN PIPELINE
+# MAIN
 # =============================================================================
 def main(csv_file, output_json='report.json'):
     print("Loading dataset...")
@@ -729,7 +783,7 @@ def main(csv_file, output_json='report.json'):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_raw)
 
-    # Spatial weights
+    # Spatial weights (based on time)
     W = build_spatial_weights(timestamps, decay=0.1)
     spatial_lag = W @ X_scaled
 
@@ -748,10 +802,11 @@ def main(csv_file, output_json='report.json'):
     y_train, y_test = y_seq[:split], y_seq[split:]
     spatial_train, spatial_test = spatial_seq[:split], spatial_seq[split:]
 
-    # Baseline models
+    # ---------- Baseline models (including Transformer and DeepAR) ----------
     X_train_flat = X_train.reshape(X_train.shape[0], -1)
     X_test_flat = X_test.reshape(X_test.shape[0], -1)
     baselines = {}
+
     lr = LinearRegression().fit(X_train_flat, y_train)
     baselines['LinearRegression'] = {'mse': mean_squared_error(y_test, lr.predict(X_test_flat)),
                                      'mae': mean_absolute_error(y_test, lr.predict(X_test_flat)),
@@ -775,12 +830,45 @@ def main(csv_file, output_json='report.json'):
     except:
         baselines['VAR(2)'] = {'mse': np.nan, 'mae': np.nan, 'r2': np.nan}
 
+    # Transformer
+    transformer = TransformerForecaster(input_dim=X_train.shape[2])
+    transformer.to(device)
+    opt = optim.Adam(transformer.parameters(), lr=0.001)
+    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32).view(-1,1).to(device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    for epoch in range(80):
+        transformer.train()
+        opt.zero_grad()
+        pred = transformer(X_train_t)
+        loss = nn.MSELoss()(pred, y_train_t)
+        loss.backward()
+        opt.step()
+    transformer.eval()
+    with torch.no_grad():
+        y_pred_tr = transformer(X_test_t).cpu().numpy().flatten()
+    baselines['Transformer'] = {'mse': mean_squared_error(y_test, y_pred_tr),
+                                'mae': mean_absolute_error(y_test, y_pred_tr),
+                                'r2': r2_score(y_test, y_pred_tr)}
+
+    # DeepAR
+    deepar = DeepAR(input_dim=X_train.shape[2])
+    deepar = train_deepar(deepar, X_train, y_train, epochs=50)
+    deepar.eval()
+    with torch.no_grad():
+        mu_test, _ = deepar(X_test_t)
+        y_pred_dp = mu_test.cpu().numpy().flatten()
+    baselines['DeepAR'] = {'mse': mean_squared_error(y_test, y_pred_dp),
+                           'mae': mean_absolute_error(y_test, y_pred_dp),
+                           'r2': r2_score(y_test, y_pred_dp)}
+
     print("\n" + "="*80)
     print("BASELINE MODELS")
     print("="*80)
     for name, met in baselines.items():
         print(f"{name:15} MSE={met['mse']:.4f}  MAE={met['mae']:.4f}  R²={met['r2']:.4f}")
 
+    # ---------- BSGEM-HFE training ----------
     # Base model (without HFE, without endogenous, without regime)
     print("Training base model (without HFE)...")
     base_model = BSGEM_VAE(input_dim=X_train.shape[2], latent_dim=8, hidden_dim=64,
@@ -796,7 +884,6 @@ def main(csv_file, output_json='report.json'):
         y_pred_test_base, _ = base_model(X_test_t)
         residuals_test = y_test - y_pred_test_base.cpu().numpy().flatten()
 
-    # Compute Ψ (linear combination of past residuals)
     psi_train = np.zeros_like(residuals)
     for i in range(2, len(residuals)):
         psi_train[i] = 0.5*residuals[i-1] + 0.3*residuals[i-2]
@@ -808,7 +895,6 @@ def main(csv_file, output_json='report.json'):
     psi_test_aug = psi_test.reshape(-1,1,1).repeat(window, axis=1)
     X_train_aug = np.concatenate([X_train, psi_train_aug], axis=2)
     X_test_aug = np.concatenate([X_test, psi_test_aug], axis=2)
-    # Add spatial lag
     X_train_aug = np.concatenate([X_train_aug, spatial_train], axis=2)
     X_test_aug = np.concatenate([X_test_aug, spatial_test], axis=2)
 
@@ -819,18 +905,26 @@ def main(csv_file, output_json='report.json'):
     final_model, train_losses, val_losses = train_vae(final_model, X_train_aug, y_train,
                                                      X_test_aug, y_test, epochs=200, patience=20)
 
+    # Interval forecasts (sample 30 times from posterior)
     final_model.eval()
     with torch.no_grad():
         X_test_t = torch.tensor(X_test_aug, dtype=torch.float32).to(device)
-        y_pred, _ = final_model(X_test_t)
-        y_pred = y_pred.cpu().numpy().flatten()
+        n_samples = 30
+        y_pred_samples = []
+        for _ in range(n_samples):
+            y_pred_s, _ = final_model(X_test_t)
+            y_pred_samples.append(y_pred_s.cpu().numpy().flatten())
+        y_pred_samples = np.array(y_pred_samples)
+        y_pred_mean = y_pred_samples.mean(axis=0)
+        y_pred_lower = np.percentile(y_pred_samples, 2.5, axis=0)
+        y_pred_upper = np.percentile(y_pred_samples, 97.5, axis=0)
     y_true = y_test
 
-    mse = mean_squared_error(y_true, y_pred)
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred_mean)
+    mae = mean_absolute_error(y_true, y_pred_mean)
+    r2 = r2_score(y_true, y_pred_mean)
     print("\n" + "="*80)
-    print("FINAL BSGEM-HFE (full model)")
+    print("FINAL BSGEM-HFE (full model with HMM transitions, interval forecasts)")
     print("="*80)
     print(f"MSE={mse:.4f}  MAE={mae:.4f}  R²={r2:.4f}")
 
@@ -849,8 +943,9 @@ def main(csv_file, output_json='report.json'):
     # Plotting
     plt.figure(figsize=(12,5))
     plt.plot(y_true, label='True', marker='o')
-    plt.plot(y_pred, label='BSGEM-HFE', marker='s', linestyle='--')
-    plt.title('BSGEM-HFE: Actual vs Predicted Irrationality')
+    plt.plot(y_pred_mean, label='BSGEM-HFE', marker='s', linestyle='--')
+    plt.fill_between(range(len(y_true)), y_pred_lower, y_pred_upper, alpha=0.3, label='95% CI')
+    plt.title('BSGEM-HFE: Actual vs Predicted Irrationality with Uncertainty')
     plt.legend()
     plt.grid(True)
     plt.show(block=False)
